@@ -1,0 +1,2121 @@
+import websocket
+import json
+import threading
+import time
+import requests
+import re
+import logging
+import ssl
+import traceback
+import os
+import uuid
+import io
+from datetime import datetime
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto, ReplyKeyboardMarkup, \
+    MenuButton, MenuButtonCommands
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler, Filters, \
+    ConversationHandler
+import openai  # Using older openai==0.28 version
+from solders.keypair import Keypair
+
+# ============= CUSTOMIZABLE PROMPT FOR GPT =============
+MEMECOIN_GENERATION_PROMPT = """You are an expert in creating Solana memecoins. Based on the content of this tweet creating a ticker and a name for the token"""
+# =================================================
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('discord_telegram_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Create logs directory structure
+LOGS_DIR = "logs"
+NOTIFICATION_LOGS_DIR = os.path.join(LOGS_DIR, "notifications")
+API_LOGS_DIR = os.path.join(LOGS_DIR, "api_calls")
+TOKEN_LOGS_DIR = os.path.join(LOGS_DIR, "tokens")
+for directory in [LOGS_DIR, NOTIFICATION_LOGS_DIR, API_LOGS_DIR, TOKEN_LOGS_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+# Configuration
+DISCORD_TOKEN = "REPLACE WITH ACTUAL"  # Replace with a fresh token
+DISCORD_CHANNEL_ID = "REPLACE WITH ACTUAL"
+TELEGRAM_TOKEN = "REPLACE WITH ACTUAL"
+TELEGRAM_GROUP_ID = "-REPLACE WITH ACTUAL"  # Replace with your group chat ID (will be negative)
+OPENAI_API_KEY = "REPLACE WITH ACTUAL"  # Replace with your OpenAI API key
+PUMP_PORTAL_API_KEY = "REPLACE WITH ACTUAL"  # Replace with your Pump Portal API key
+GPT_MODEL = "gpt-3.5-turbo"  # Using GPT-3.5 Turbo as requested
+
+# PumpPortal API endpoints
+PUMP_PORTAL_TRADE_API = "https://pumpportal.fun/api/trade"
+PUMP_PORTAL_CREATE_TOKEN_API = "https://pumpportal.fun/api/create-token"
+PUMP_PORTAL_IPFS_API = "https://pump.fun/api/ipfs"
+PUMP_PORTAL_CREATE_WALLET_API = "https://pumpportal.fun/api/create-wallet"
+
+# User settings storage
+USER_SETTINGS = {}
+
+# Conversation states
+SLIPPAGE, PRIORITY_FEE, WALLET_ADDRESS, TOKEN_NAME, TOKEN_SYMBOL, TOKEN_SUPPLY = range(6)
+
+# Initialize OpenAI
+openai.api_key = OPENAI_API_KEY
+
+# WebSocket state
+ws = None
+heartbeat_interval = None
+last_sequence = None
+session_id = None
+resume_gateway_url = None
+
+# Message cache
+processed_messages = set()
+message_data_cache = {}  # Store message data for button callbacks
+token_info_cache = {}  # Store generated token info
+
+# Periodic cleanup for processed_messages
+def cleanup_processed_messages():
+    global processed_messages
+    while True:
+        time.sleep(3600)  # Cleanup every hour
+        processed_messages.clear()
+        logger.info("Cleared processed_messages set to free up memory")
+
+threading.Thread(target=cleanup_processed_messages, daemon=True).start()
+
+# Initialize Telegram Bot
+updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+dispatcher = updater.dispatcher
+bot = updater.dispatcher.bot
+
+def log_api_call(endpoint, request_data, response_data, success=True):
+    """Log API calls to PumpPortal"""
+    log_id = str(uuid.uuid4())
+    log_filename = os.path.join(API_LOGS_DIR, f"{log_id}.json")
+
+    try:
+        with open(log_filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'endpoint': endpoint,
+                'request': request_data,
+                'response': response_data,
+                'success': success
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"API call logged to {log_filename}")
+        return log_id
+    except Exception as e:
+        logger.error(f"Failed to log API call: {e}")
+        return None
+
+def log_token_creation(token_data, notification_id, user_id, status):
+    """Log token creation details"""
+    log_id = str(uuid.uuid4())
+    log_filename = os.path.join(TOKEN_LOGS_DIR, f"{log_id}.json")
+
+    try:
+        with open(log_filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'token_data': token_data,
+                'notification_id': notification_id,
+                'user_id': user_id,
+                'status': status
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"Token creation logged to {log_filename}")
+        return log_id
+    except Exception as e:
+        logger.error(f"Failed to log token creation: {e}")
+        return None
+
+def log_notification(notification_id, message_data):
+    """Log notification details"""
+    log_filename = os.path.join(NOTIFICATION_LOGS_DIR, f"{notification_id}.json")
+
+    try:
+        with open(log_filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'message_data': message_data
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"Notification logged to {log_filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to log notification {notification_id}: {e}")
+        return False
+
+def get_user_settings(user_id):
+    """Get user settings or create defaults"""
+    if user_id not in USER_SETTINGS:
+        USER_SETTINGS[user_id] = {
+            'slippage': 5,  # Default 5%
+            'priority_fee': 0.1,  # Default 0.1 SOL
+            'wallet_address': None,
+            'pool': 'pump',  # Default pool
+            'skip_preflight': True,  # Default skip preflight
+            'jito_only': False,  # Default not jito only
+            'denominated_in_sol': True  # Default denominated in SOL
+        }
+    return USER_SETTINGS[user_id]
+
+def call_pump_portal_api(endpoint, data):
+    """Call PumpPortal API with logging"""
+    url = f"https://pumpportal.fun/api/{endpoint}"
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': PUMP_PORTAL_API_KEY
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response_data = response.json() if response.content else {}
+
+        # Log the API call
+        log_id = log_api_call(endpoint, data, response_data, response.status_code == 200)
+
+        if response.status_code == 200:
+            logger.info(f"Successful API call to {endpoint}: {response_data}")
+            return True, response_data, log_id
+        else:
+            logger.error(f"Failed API call to {endpoint}: {response.status_code} - {response_data}")
+            return False, response_data, log_id
+
+    except Exception as e:
+        logger.error(f"Error calling {endpoint} API: {e}")
+        return False, {'error': str(e)}, None
+
+def create_wallet_via_pump_portal():
+    """Create a new Solana wallet via PumpPortal API"""
+    try:
+        response = requests.get(url=PUMP_PORTAL_CREATE_WALLET_API)
+
+        if response.status_code == 200:
+            wallet_data = response.json()
+            # Log the API call (without private keys in the logs)
+            log_data = {
+                "public_key": wallet_data.get("public_key", "Unknown"),
+                "api_key_created": bool(wallet_data.get("api_key"))
+            }
+            log_id = log_api_call("create-wallet", {}, log_data, True)
+            return True, wallet_data, log_id
+        else:
+            logger.error(f"Failed to create wallet: {response.status_code} - {response.text}")
+            return False, {"error": f"API Error: {response.reason}"}, None
+
+    except Exception as e:
+        logger.error(f"Error creating wallet: {e}")
+        return False, {"error": str(e)}, None
+
+def download_image(url):
+    """Download image from URL"""
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            return response.content
+        logger.error(f"Failed to download image: {response.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+        return None
+
+def create_token_metadata(token_name, token_symbol, tweet_data):
+    """Create token metadata and upload image to IPFS"""
+    try:
+        # Prepare form data
+        form_data = {
+            'name': token_name,
+            'symbol': token_symbol,
+            'description': f"Token based on tweet by {tweet_data.get('author', 'Unknown')}",
+            'twitter': tweet_data.get('url', 'https://x.com'),
+            'telegram': 'https://t.me',
+            'website': 'https://pumpportal.fun',
+            'showName': 'true'
+        }
+
+        # Determine image to use
+        image_url = None
+        image_data = None
+
+        if tweet_data.get('image_url'):
+            # Use tweet image
+            image_url = tweet_data['image_url']
+            image_data = download_image(image_url)
+            image_filename = 'tweet_image.jpg'
+        elif tweet_data.get('author_icon'):
+            # Use author profile image
+            image_url = tweet_data['author_icon']
+            image_data = download_image(image_url)
+            image_filename = 'profile_image.jpg'
+
+        if not image_data:
+            logger.warning("No image found or could not download image. Using default placeholder.")
+            # Create a simple colored square as placeholder
+            from PIL import Image
+            img = Image.new('RGB', (500, 500), color=(73, 109, 137))
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            image_data = buf.getvalue()
+            image_filename = 'default_image.png'
+
+        # Prepare files for upload
+        files = {
+            'file': (image_filename, image_data, 'image/jpeg' if image_filename.endswith('.jpg') else 'image/png')
+        }
+
+        # Upload to IPFS via PumpPortal
+        response = requests.post(
+            PUMP_PORTAL_IPFS_API,
+            data=form_data,
+            files=files
+        )
+
+        if response.status_code != 200:
+            logger.error(f"IPFS upload failed: {response.status_code} - {response.text}")
+            return None
+
+        metadata_response = response.json()
+        logger.info(f"IPFS Metadata created: {metadata_response}")
+
+        # Return token metadata
+        return {
+            'name': token_name,
+            'symbol': token_symbol,
+            'uri': metadata_response.get('metadataUri')
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating token metadata: {e}")
+        traceback.print_exc()
+        return None
+
+def create_token_via_pump_portal(token_data, tweet_data, user_id):
+    """Create a token via PumpPortal API"""
+    # Extract token data for API call
+    try:
+        settings = get_user_settings(user_id)
+
+        # Extract data from token_info
+        lines = token_data.split('\n')
+        token_name = None
+        token_symbol = None
+
+        for line in lines:
+            if "Token Name:" in line:
+                token_name = line.split(':', 1)[1].strip()
+            elif "Ticker Symbol:" in line:
+                token_symbol = line.split(':', 1)[1].strip()
+                # Remove $ if present
+                token_symbol = token_symbol.replace('$', '').strip()
+
+        if not token_name or not token_symbol:
+            return False, {"error": "Could not parse token name or symbol from GPT response"}, None
+
+        # Generate a random keypair for token
+        mint_keypair = Keypair()
+
+        # Create token metadata with image
+        token_metadata = create_token_metadata(token_name, token_symbol, tweet_data)
+        if not token_metadata:
+            return False, {"error": "Failed to create token metadata"}, None
+
+        # Prepare API call data
+        api_data = {
+            'action': 'create',
+            'tokenMetadata': token_metadata,
+            'mint': str(mint_keypair),
+            'denominatedInSol': 'true',
+            'amount': 1,  # Dev buy of 1 SOL
+            'slippage': settings['slippage'],
+            'priorityFee': settings['priority_fee'],
+            'pool': settings['pool'],
+            'skipPreflight': str(settings['skip_preflight']).lower(),
+            'jitoOnly': str(settings['jito_only']).lower()
+        }
+
+        # Call PumpPortal API
+        success, response_data, log_id = call_pump_portal_api('trade', api_data)
+
+        if success and response_data.get('signature'):
+            response_data['token_address'] = str(mint_keypair.pubkey())
+            response_data['name'] = token_name
+            response_data['symbol'] = token_symbol
+
+        return success, response_data, log_id
+
+    except Exception as e:
+        logger.error(f"Error creating token via PumpPortal: {e}")
+        traceback.print_exc()
+        return False, {"error": str(e)}, None
+
+def buy_token(user_id, mint, amount, settings=None):
+    """Buy a token using PumpPortal API"""
+    if settings is None:
+        settings = get_user_settings(user_id)
+
+    # Prepare API call data
+    api_data = {
+        "action": "buy",
+        "mint": mint,
+        "amount": str(amount),
+        "denominatedInSol": str(settings['denominated_in_sol']).lower(),
+        "slippage": settings['slippage'],
+        "priorityFee": settings['priority_fee'],
+        "pool": settings['pool'],
+        "skipPreflight": str(settings['skip_preflight']).lower(),
+        "jitoOnly": str(settings['jito_only']).lower()
+    }
+
+    # Call PumpPortal API
+    success, response_data, log_id = call_pump_portal_api('trade', api_data)
+
+    return success, response_data, log_id
+
+def sell_token(user_id, mint, amount_percentage, settings=None):
+    """Sell a token using PumpPortal API"""
+    if settings is None:
+        settings = get_user_settings(user_id)
+
+    # Prepare API call data
+    api_data = {
+        "action": "sell",
+        "mint": mint,
+        "amount": f"{amount_percentage}%",  # Amount as percentage
+        "denominatedInSol": "false",  # When selling, always denominated in tokens
+        "slippage": settings['slippage'],
+        "priorityFee": settings['priority_fee'],
+        "pool": settings['pool'],
+        "skipPreflight": str(settings['skip_preflight']).lower(),
+        "jitoOnly": str(settings['jito_only']).lower()
+    }
+
+    # Call PumpPortal API
+    success, response_data, log_id = call_pump_portal_api('trade', api_data)
+
+    return success, response_data, log_id
+
+def check_wallet_balance(wallet_address):
+    """Check wallet balance via Solana Explorer API"""
+    try:
+        # Call Solana Explorer API to get balance
+        response = requests.post(
+            f"https://api.mainnet-beta.solana.com",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [wallet_address]
+            },
+            headers={
+                'Content-Type': 'application/json'
+            }
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            if 'result' in data and 'value' in data['result']:
+                # Convert lamports to SOL (1 SOL = 1,000,000,000 lamports)
+                balance_lamports = data['result']['value']
+                balance_sol = balance_lamports / 1_000_000_000
+                return True, {
+                    "sol_balance": balance_sol,
+                    "lamports": balance_lamports
+                }, None
+            else:
+                return False, {"error": "Invalid response format"}, None
+        else:
+            return False, {"error": f"API Error: {response.status_code}"}, None
+
+    except Exception as e:
+        logger.error(f"Error checking wallet balance: {e}")
+        return False, {"error": str(e)}, None
+
+def check_wallet_tokens(wallet_address):
+    """Check token balances in wallet via Solana Explorer API"""
+    try:
+        # Call Solana Explorer API to get token accounts
+        response = requests.post(
+            f"https://api.mainnet-beta.solana.com",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    wallet_address,
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding": "jsonParsed"}
+                ]
+            },
+            headers={
+                'Content-Type': 'application/json'
+            }
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            tokens = []
+
+            if 'result' in data and 'value' in data['result']:
+                for account in data['result']['value']:
+                    if 'account' in account and 'data' in account['account']:
+                        parsed_data = account['account']['data'].get('parsed', {})
+                        info = parsed_data.get('info', {})
+
+                        if 'mint' in info and 'tokenAmount' in info:
+                            token_amount = info['tokenAmount']
+                            tokens.append({
+                                'mint': info['mint'],
+                                'amount': float(token_amount.get('uiAmount', 0)),
+                                'decimals': token_amount.get('decimals', 0)
+                            })
+
+            return True, {"tokens": tokens}, None
+        else:
+            return False, {"error": f"API Error: {response.status_code}"}, None
+
+    except Exception as e:
+        logger.error(f"Error checking wallet tokens: {e}")
+        return False, {"error": str(e)}, None
+
+def clean_text(text):
+    """Extract clean text from Discord embed content"""
+    if not text:
+        return ""
+
+    # Remove formatting markers
+    text = re.sub(r'\*\*', '', text)
+
+    # Remove problematic patterns
+    text = re.sub(r'- ~~ ~~>.*?https://x\.com/\w+/status/\d+\)?', '', text)
+    text = re.sub(r'@\w+\)', '', text)
+
+    # Extract main content (before any URLs)
+    main_content = text.split("http")[0] if "http" in text else text
+    main_content = re.sub(r'\s+', ' ', main_content).strip()
+
+    # Find the main tweet URL
+    url_match = re.search(r'https://(?:x\.com|twitter\.com)/\w+/status/\d+', text)
+    main_url = url_match.group(0) if url_match else ""
+
+    # Combine content and URL
+    result = main_content
+    if main_url and main_url not in result:
+        result = f"{result}\n\n{main_url}"
+
+    return result
+
+def extract_tweet_data(embed):
+    """Extract tweet data from Discord embed"""
+    data = {
+        'author': None,
+        'author_username': None,
+        'author_icon': None,
+        'content': None,
+        'original_tweet': None,
+        'quoted_tweet': None,
+        'quoted_author': None,
+        'image_url': None,
+        'url': None
+    }
+
+    logger.debug(f"Extracting tweet data from embed: {json.dumps(embed, indent=2)}")
+
+    # Extract author info
+    if 'author' in embed and embed['author'].get('name'):
+        author_name = embed['author']['name']
+        data['author'] = author_name
+        logger.debug(f"Extracted author: {author_name}")
+
+        # Try to extract username from author name if in format "Name (@username)"
+        username_match = re.search(r'$$@([^)]+)$$', author_name)
+        if username_match:
+            data['author_username'] = username_match.group(1)
+            logger.debug(f"Extracted author_username: {data['author_username']}")
+
+        data['author_icon'] = embed['author'].get('icon_url')
+        logger.debug(f"Extracted author_icon: {data['author_icon']}")
+
+    # Extract content
+    if 'description' in embed:
+        data['content'] = embed['description']
+        logger.debug(f"Extracted content: {data['content']}")
+
+    # Extract URL
+    if 'url' in embed:
+        data['url'] = embed['url']
+        logger.debug(f"Extracted url: {data['url']}")
+
+    # Extract image
+    if 'image' in embed and 'url' in embed['image']:
+        data['image_url'] = embed['image']['url']
+        logger.debug(f"Extracted image_url: {data['image_url']}")
+
+    # Process fields (replies, quotes)
+    if 'fields' in embed:
+        for field in embed.get('fields', []):
+            field_name = field.get('name', '')
+            field_value = field.get('value', '')
+
+            if "Replying to" in field_name:
+                data['original_tweet'] = field_value
+                reply_match = re.search(r'Replying to\s+(.+?):', field_name)
+                if reply_match:
+                    data['quoted_author'] = reply_match.group(1)
+                logger.debug(f"Extracted original_tweet and quoted_author: {data['original_tweet']}, {data['quoted_author']}")
+
+            elif "Quoted Tweet" in field_name:
+                data['quoted_tweet'] = field_value
+                quote_match = re.search(r'Quoted\s+(.+?):', field_name)
+                if quote_match:
+                    data['quoted_author'] = quote_match.group(1)
+                logger.debug(f"Extracted quoted_tweet and quoted_author: {data['quoted_tweet']}, {data['quoted_author']}")
+
+    return data
+
+def format_message(tweet_data, notification_id):
+    """Format message for Telegram with UUID"""
+    message_parts = []
+
+    # Author name in bold
+    if tweet_data.get('author'):
+        message_parts.append(f"**{tweet_data['author']}**")
+
+    # Main content
+    if tweet_data.get('content'):
+        cleaned_content = clean_text(tweet_data['content'])
+        if cleaned_content:
+            message_parts.append(f"\"{cleaned_content}\"")
+
+    # Original tweet (for replies)
+    if tweet_data.get('original_tweet'):
+        cleaned_original = clean_text(tweet_data['original_tweet'])
+        if cleaned_original:
+            reply_header = "*↩️ Original Tweet:**"
+            if tweet_data.get('quoted_author'):
+                reply_header = f"**↩️ Original Tweet from {tweet_data['quoted_author']}:**"
+            message_parts.append(f"{reply_header}\n\"{cleaned_original}\"")
+
+    # Quoted tweet
+    if tweet_data.get('quoted_tweet'):
+        cleaned_quote = clean_text(tweet_data['quoted_tweet'])
+        if cleaned_quote:
+            quote_header = "**💬 Quoted Tweet:**"
+            if tweet_data.get('quoted_author'):
+                quote_header = f"**💬 Quoted Tweet from {tweet_data['quoted_author']}:**"
+            message_parts.append(f"{quote_header}\n\"{cleaned_quote}\"")
+
+    # Direct URL
+    if tweet_data.get('url'):
+        main_url = tweet_data['url']
+        if not any(main_url in part for part in message_parts):
+            message_parts.append(f"{main_url}")
+
+    # Add UUID for tracking
+    message_parts.append(f"ID: `{notification_id}`")
+
+    return "\n\n".join(message_parts)
+
+def create_token_button(notification_id):
+    """Create inline keyboard with Create Token button"""
+    keyboard = [[InlineKeyboardButton("Create Token", callback_data=f"create_token:{notification_id}")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_settings_keyboard():
+    """Create settings keyboard for bot private chat"""
+    keyboard = [
+        [InlineKeyboardButton("⚙️ Set Slippage", callback_data="settings_slippage"),
+         InlineKeyboardButton("💰 Set Priority Fee", callback_data="settings_fee")],
+        [InlineKeyboardButton("👛 Create/Update Wallet", callback_data="settings_wallet"),
+         InlineKeyboardButton("💼 Check Wallet Balance", callback_data="check_balance")],
+        [InlineKeyboardButton("🔄 Set Pool", callback_data="settings_pool"),
+         InlineKeyboardButton("⏭️ Toggle Preflight", callback_data="toggle_preflight")],
+        [InlineKeyboardButton("🚀 Toggle Jito Only", callback_data="toggle_jito"),
+         InlineKeyboardButton("💱 Toggle Denomination", callback_data="toggle_denomination")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_pool_selection_keyboard():
+    """Create keyboard for pool selection"""
+    keyboard = [
+        [InlineKeyboardButton("Pump", callback_data="pool_pump"),
+         InlineKeyboardButton("Raydium", callback_data="pool_raydium"),
+         InlineKeyboardButton("Auto", callback_data="pool_auto")],
+        [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def send_to_telegram_group(tweet_data, media_urls=None, notification_id=None):
+    """Send message to Telegram group with Create Token button"""
+    try:
+        if not notification_id:
+            notification_id = str(uuid.uuid4())
+
+        # Format message with UUID
+        formatted_message = format_message(tweet_data, notification_id)
+
+        # Store message data for later retrieval via callback
+        message_data_cache[notification_id] = {
+            'text': formatted_message,
+            'media': media_urls,
+            'tweet_data': tweet_data
+        }
+
+        # Log notification
+        log_notification(notification_id, {
+            'formatted_message': formatted_message,
+            'original_data': tweet_data,
+            'media_urls': media_urls
+        })
+
+        # Create button
+        reply_markup = create_token_button(notification_id)
+
+        # Text-only message
+        if not media_urls:
+            response = bot.send_message(
+                chat_id=TELEGRAM_GROUP_ID,
+                text=formatted_message,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+                disable_web_page_preview=False
+            )
+            logger.info(f"Successfully sent text message to Telegram: {notification_id}")
+            return True
+
+        # Single media
+        elif len(media_urls) == 1:
+            response = bot.send_photo(
+                chat_id=TELEGRAM_GROUP_ID,
+                photo=media_urls[0],
+                caption=formatted_message,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Successfully sent photo message to Telegram: {notification_id}")
+            return True
+
+        # Multiple media
+        else:
+            media_items = []
+            for i, url in enumerate(media_urls[:10]):
+                item = InputMediaPhoto(media=url)
+                if i == 0:
+                    item.caption = formatted_message
+                    item.parse_mode = "Markdown"
+                media_items.append(item)
+
+            # Send media group
+            response = bot.send_media_group(
+                chat_id=TELEGRAM_GROUP_ID,
+                media=media_items
+            )
+
+            # Then send the button in a follow-up message
+            if response:
+                bot.send_message(
+                    chat_id=TELEGRAM_GROUP_ID,
+                    text="Actions:",
+                    reply_markup=reply_markup
+                )
+            logger.info(f"Successfully sent media group to Telegram: {notification_id}")
+            return True
+
+    except Exception as e:
+        logger.error(f"Error sending to Telegram group (notification_id={notification_id}): {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+def generate_token_with_openai(tweet_data):
+    """Generate token information using OpenAI based on tweet content"""
+    try:
+        # Extract author and content from tweet data
+        author = tweet_data.get('author', 'Unknown')
+        content = clean_text(tweet_data.get('content', ''))
+        has_image = "Yes" if tweet_data.get('image_url') else "No"
+
+        # Format the prompt using the template
+        prompt = MEMECOIN_GENERATION_PROMPT.format(
+            author=author,
+            content=content,
+            has_image=has_image
+        )
+
+        # Call OpenAI API (using v0.28 format)
+        response = openai.ChatCompletion.create(
+            model=GPT_MODEL,  # Using GPT-3.5 Turbo
+            messages=[
+                {"role": "system",
+                 "content": "You are a creative crypto token generator that creates Solana memecoin concepts based on trending tweets."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+            temperature=0.7
+        )
+
+        # Extract response
+        token_info = response.choices[0].message['content']
+        return token_info
+
+    except Exception as e:
+        logger.error(f"Error generating token with OpenAI: {e}")
+        return f"Error generating token: {str(e)}"
+
+def launch_token_flow(query, token_log_id):
+    """Launch token based on generated information"""
+    user_id = query.from_user.id
+    user_settings = get_user_settings(user_id)
+
+    if token_log_id not in token_info_cache:
+        query.message.reply_text("⚠️ Token data not found. Please regenerate the token.")
+        return
+
+    # Get token data and tweet data
+    token_info = token_info_cache[token_log_id]['token_info']
+    notification_id = token_info_cache[token_log_id]['notification_id']
+    tweet_data = token_info_cache[token_log_id]['tweet_data']
+
+    # Check if wallet is set
+    if not user_settings['wallet_address']:
+        # Create wallet message
+        query.message.reply_text(
+            "⚠️ You need to set up a wallet first before launching a token.\n\n"
+            "Should I create a new wallet for you?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, create wallet", callback_data=f"create_wallet:{token_log_id}")],
+                [InlineKeyboardButton("❌ No, cancel", callback_data="cancel_launch")]
+            ])
+        )
+        return
+
+    query.message.reply_text(
+        "🚀 Launching token on Solana network...\n"
+        "This process may take a minute. Please wait.",
+        parse_mode="Markdown"
+    )
+
+    # Create the token via PumpPortal
+    success, response_data, api_log_id = create_token_via_pump_portal(token_info, tweet_data, user_id)
+
+    if success and response_data.get('signature'):
+        # Format the success message with transaction details
+        token_address = response_data.get('token_address', 'Unknown')
+        tx_signature = response_data.get('signature', 'Unknown')
+        token_name = response_data.get('name', 'Token')
+        token_symbol = response_data.get('symbol', 'TKN')
+
+        success_message = (
+            f"✅ *Token Successfully Created!*\n\n"
+            f"*Token Name:* {token_name}\n"
+            f"*Symbol:* {token_symbol}\n"
+            f"*Token Address:* `{token_address}`\n\n"
+            f"*Transaction:* [View on Solscan](https://solscan.io/tx/{tx_signature})\n\n"
+            f"*Trade:* [Trade on Pump.fun](https://pump.fun/token/{token_address})\n\n"
+            f"*Log ID:* `{api_log_id}`"
+        )
+
+        query.message.reply_text(
+            success_message,
+            parse_mode="Markdown",
+            disable_web_page_preview=False,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 View Token", url=f"https://pump.fun/token/{token_address}")],
+                [InlineKeyboardButton("💵 Buy More", callback_data=f"buy_more:{token_address}"),
+                 InlineKeyboardButton("💰 Sell", callback_data=f"sell_token:{token_address}")]
+            ])
+        )
+
+        # Also send notification to the group
+        bot.send_message(
+            chat_id=TELEGRAM_GROUP_ID,
+            text=(
+                f"🎉 *New Token Launched!*\n\n"
+                f"*{token_name} ({token_symbol})*\n"
+                f"Based on tweet ID: `{notification_id}`\n\n"
+                f"*Token Address:* `{token_address}`\n"
+                f"*Trade:* [Trade on Pump.fun](https://pump.fun/token/{token_address})\n"
+            ),
+            parse_mode="Markdown",
+            disable_web_page_preview=False
+        )
+
+    else:
+        # Format the error message
+        error_msg = response_data.get('error', 'Unknown error')
+        error_message = (
+            f"❌ *Token Creation Failed*\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Please check your settings and try again. "
+            f"Make sure you have enough SOL in your wallet for gas fees and initial liquidity."
+        )
+
+        query.message.reply_text(
+            error_message,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Adjust Settings", callback_data="show_settings")],
+                [InlineKeyboardButton("🔄 Try Again", callback_data=f"launch_token:{token_log_id}")]
+            ])
+        )
+
+def send_token_generation_to_bot_chat(query, notification_id, settings=None):
+    """Send token generation process to user's private chat with bot"""
+    user_id = query.from_user.id
+
+    try:
+        # Get user settings
+        user_settings = settings if settings else get_user_settings(user_id)
+
+        # Check if we have this notification cached
+        if notification_id not in message_data_cache:
+            query.message.reply_text("⚠️ Tweet data not found. Please try again with a more recent tweet.")
+            return
+
+        tweet_data = message_data_cache[notification_id]['tweet_data']
+
+        # Reply to group message that processing is happening in private chat
+        query.message.reply_text(
+            "⏳ Processing token generation. Check your private chat with the bot.",
+            quote=True
+        )
+
+        # Send initial message to private chat
+        processing_message = bot.send_message(
+            chat_id=user_id,
+            text=f"⏳ Generating token based on tweet (ID: `{notification_id}`)...",
+            parse_mode="Markdown"
+        )
+
+        # Generate token with OpenAI (GPT-3.5 Turbo)
+        token_info = generate_token_with_openai(tweet_data)
+
+        # Log token generation
+        token_log_id = log_token_creation(token_info, notification_id, user_id, "generated")
+
+        # Cache token info for later use
+        token_info_cache[token_log_id] = {
+            'token_info': token_info,
+            'notification_id': notification_id,
+            'tweet_data': tweet_data
+        }
+
+        # Send token info to private chat
+        bot.send_message(
+            chat_id=user_id,
+            text=f"🪙 *Generated Token*\n\nTweet ID: `{notification_id}`\nLog ID: `{token_log_id}`\n\n{token_info}\n\n"
+                 f"*Current Settings:*\n"
+                 f"• Slippage: {user_settings['slippage']}%\n"
+                 f"• Priority Fee: {user_settings['priority_fee']} SOL\n"
+                 f"• Pool: {user_settings['pool']}\n"
+                 f"• Skip Preflight: {user_settings['skip_preflight']}\n"
+                 f"• Jito Only: {user_settings['jito_only']}\n"
+                 f"• Denominated in SOL: {user_settings['denominated_in_sol']}\n"
+                 f"• Wallet: {user_settings['wallet_address'] or 'Not set'}\n",
+            parse_mode="Markdown"
+        )
+
+        # Create buttons for next actions
+        create_token_keyboard = [
+            [InlineKeyboardButton("🚀 Launch Token on Solana", callback_data=f"launch_token:{token_log_id}")],
+            [InlineKeyboardButton("⚙️ Adjust Settings", callback_data="show_settings")],
+            [InlineKeyboardButton("🔄 Regenerate Token", callback_data=f"regenerate:{notification_id}")]
+        ]
+
+        bot.send_message(
+            chat_id=user_id,
+            text="*What would you like to do next?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(create_token_keyboard)
+        )
+
+        return token_log_id
+
+    except Exception as e:
+        logger.error(f"Error in token generation process: {e}")
+        traceback.print_exc()
+
+        # Inform user of error
+        try:
+            bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Error generating token: {str(e)}\nPlease try again later.",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+        return None
+
+# Discord WebSocket handlers
+def on_message(ws, message):
+    global last_sequence, session_id
+
+    data = json.loads(message)
+    op = data.get('op')
+
+    logger.debug(f"Received WebSocket message with op: {op}")
+
+    # Update sequence for resuming if needed
+    if 's' in data and data['s'] is not None:
+        last_sequence = data['s']
+        logger.debug(f"Updated last_sequence: {last_sequence}")
+
+    # Handle Gateway Dispatch events
+    if op == 0:  # Dispatch
+        event_type = data.get('t')
+        event_data = data.get('d')
+
+        # Handle READY event
+        if event_type == 'READY':
+            logger.info("Connected to Discord Gateway")
+            session_id = event_data.get('session_id')
+            logger.info(f"Session ID: {session_id}")
+
+        # Handle messages
+        elif event_type == 'MESSAGE_CREATE':
+            channel_id = event_data.get('channel_id')
+            logger.info(f"Received MESSAGE_CREATE for channel {channel_id}")
+
+            # Only process messages from target channel
+            if channel_id == DISCORD_CHANNEL_ID:
+                message_id = event_data.get('id')
+                logger.debug(f"Processing message ID: {message_id}")
+
+                # Skip already processed messages
+                if message_id in processed_messages:
+                    logger.info(f"Skipping already processed message ID: {message_id}")
+                    return
+
+                processed_messages.add(message_id)
+                logger.debug(f"Added message_id {message_id} to processed_messages")
+
+                # Extract embeds
+                embeds = event_data.get('embeds', [])
+                logger.info(f"Found {len(embeds)} embeds in message {message_id}")
+
+                if embeds:
+                    # Process Twitter/X embeds
+                    for embed in embeds:
+                        logger.debug(f"Processing embed: {json.dumps(embed, indent=2)}")
+                        if 'author' in embed and (
+                                'x.com' in embed.get('url', '') or 'twitter.com' in embed.get('url', '')):
+                            logger.info(f"Found Twitter/X embed in message {message_id}")
+                            tweet_data = extract_tweet_data(embed)
+
+                            # Prepare media URLs
+                            media_urls = []
+                            if tweet_data.get('image_url'):
+                                media_urls.append(tweet_data['image_url'])
+                                logger.debug(f"Added image_url to media_urls: {tweet_data['image_url']}")
+
+                            # Generate notification ID
+                            notification_id = str(uuid.uuid4())
+                            logger.debug(f"Generated notification_id: {notification_id}")
+
+                            # Forward to Telegram
+                            success = send_to_telegram_group(tweet_data, media_urls, notification_id)
+                            if success:
+                                logger.info(f"Successfully forwarded tweet to Telegram: notification_id={notification_id}")
+                            else:
+                                logger.error(f"Failed to forward tweet to Telegram: notification_id={notification_id}")
+
+    # Handle Heartbeat request
+    elif op == 1:  # Heartbeat
+        logger.debug("Received Heartbeat request")
+        send_heartbeat()
+
+    # Handle Reconnect request
+    elif op == 7:  # Reconnect
+        logger.warning("Received Reconnect request")
+        reconnect()
+
+    # Handle Invalid Session
+    elif op == 9:  # Invalid Session
+        logger.error("Received Invalid Session, reconnecting in 5 seconds")
+        time.sleep(5)
+        connect()
+
+    # Handle Hello event
+    elif op == 10:  # Hello
+        global heartbeat_interval
+        heartbeat_interval = data.get('d', {}).get('heartbeat_interval', 45000) / 1000
+        logger.info(f"Heartbeat interval: {heartbeat_interval}s")
+
+        # Start heartbeat thread
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
+
+        # Identify or Resume
+        if session_id and last_sequence:
+            logger.info("Attempting to resume session")
+            send_resume()
+        else:
+            logger.info("Starting new session with identify")
+            send_identify()
+
+    # Handle Heartbeat ACK
+    elif op == 11:  # Heartbeat ACK
+        logger.debug("Received Heartbeat ACK")
+
+def on_error(ws, error):
+    logger.error(f"WebSocket error: {error}")
+    logger.error(traceback.format_exc())
+
+def on_close(ws, close_status_code, close_msg):
+    logger.warning(f"WebSocket connection closed: {close_status_code} - {close_msg}")
+    time.sleep(5)
+    reconnect()
+
+def on_open(ws):
+    logger.info("WebSocket connection established")
+
+def send_heartbeat():
+    """Send heartbeat to Discord Gateway"""
+    global ws, last_sequence
+
+    try:
+        payload = {
+            "op": 1,
+            "d": last_sequence
+        }
+        ws.send(json.dumps(payload))
+        logger.debug(f"Sent heartbeat with sequence: {last_sequence}")
+    except Exception as e:
+        logger.error(f"Error sending heartbeat: {e}")
+
+def heartbeat_loop():
+    """Loop to send heartbeats at the specified interval"""
+    global heartbeat_interval
+
+    while True:
+        try:
+            time.sleep(heartbeat_interval)
+            send_heartbeat()
+        except Exception as e:
+            logger.error(f"Error in heartbeat loop: {e}")
+            break
+
+def send_identify():
+    """Send identify payload to Discord Gateway"""
+    global ws
+
+    try:
+        payload = {
+            "op": 2,
+            "d": {
+                "token": DISCORD_TOKEN,
+                "properties": {
+                    "$os": "linux",
+                    "$browser": "custom_bot",
+                    "$device": "custom_bot"
+                }
+            }
+        }
+        ws.send(json.dumps(payload))
+        logger.info("Sent identify payload")
+    except Exception as e:
+        logger.error(f"Error sending identify: {e}")
+
+def send_resume():
+    """Send resume payload to Discord Gateway"""
+    global ws, session_id, last_sequence
+
+    try:
+        payload = {
+            "op": 6,
+            "d": {
+                "token": DISCORD_TOKEN,
+                "session_id": session_id,
+                "seq": last_sequence
+            }
+        }
+        ws.send(json.dumps(payload))
+        logger.info(f"Sent resume payload with sequence: {last_sequence}")
+    except Exception as e:
+        logger.error(f"Error sending resume: {e}")
+
+def connect():
+    """Connect to Discord Gateway"""
+    global ws, resume_gateway_url
+
+    gateway_url = resume_gateway_url if resume_gateway_url else "wss://gateway.discord.gg/?v=9&encoding=json"
+
+    try:
+        ws = websocket.WebSocketApp(
+            gateway_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+        logger.info(f"Connecting to Discord Gateway: {gateway_url}")
+        ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    except Exception as e:
+        logger.error(f"Failed to connect to Discord Gateway: {e}")
+        logger.error(traceback.format_exc())
+        time.sleep(5)
+        connect()
+
+def reconnect():
+    """Reconnect to Discord Gateway"""
+    global ws
+
+    try:
+        if ws:
+            ws.close()
+            logger.info("Closed existing WebSocket connection")
+    except Exception as e:
+        logger.error(f"Error closing WebSocket connection: {e}")
+
+    time.sleep(5)
+    logger.info("Attempting to reconnect to Discord Gateway")
+    connect()
+
+# Telegram command handlers
+def start(update, context):
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    user_settings = get_user_settings(user_id)
+
+    welcome_message = (
+        "👋 *Welcome to Memecoin Launcher Bot!*\n\n"
+        "This bot helps you create Solana memecoins based on tweets forwarded from Discord.\n\n"
+        "*Features:*\n"
+        "• Create tokens based on trending tweets\n"
+        "• Customize trading settings\n"
+        "• Launch tokens directly on Solana\n"
+        "• Monitor your wallet balance\n\n"
+        "Use /settings to configure your preferences."
+    )
+
+    update.message.reply_text(
+        welcome_message,
+        parse_mode="Markdown",
+        reply_markup=create_settings_keyboard()
+    )
+
+def settings(update, context):
+    """Handle /settings command"""
+    user_id = update.effective_user.id
+    user_settings = get_user_settings(user_id)
+
+    settings_message = (
+        "⚙️ *Your Settings*\n\n"
+        f"• *Slippage:* {user_settings['slippage']}%\n"
+        f"• *Priority Fee:* {user_settings['priority_fee']} SOL\n"
+        f"• *Pool:* {user_settings['pool']}\n"
+        f"• *Skip Preflight:* {'✅' if user_settings['skip_preflight'] else '❌'}\n"
+        f"• *Jito Only:* {'✅' if user_settings['jito_only'] else '❌'}\n"
+        f"• *Denominated in SOL:* {'✅' if user_settings['denominated_in_sol'] else '❌'}\n"
+        f"• *Wallet:* {user_settings['wallet_address'] or 'Not set'}\n\n"
+        "Use the buttons below to update your settings."
+    )
+
+    # Handle both direct command and callback
+    if hasattr(update, 'message') and update.message:
+        update.message.reply_text(
+            settings_message,
+            parse_mode="Markdown",
+            reply_markup=create_settings_keyboard()
+        )
+    elif hasattr(update, 'callback_query') and update.callback_query:
+        update.callback_query.message.edit_text(
+            settings_message,
+            parse_mode="Markdown",
+            reply_markup=create_settings_keyboard()
+        )
+    else:
+        # Fallback for unknown update type
+        context.bot.send_message(
+            chat_id=user_id,
+            text=settings_message,
+            parse_mode="Markdown",
+            reply_markup=create_settings_keyboard()
+        )
+
+def help_command(update, context):
+    """Handle /help command"""
+    help_message = (
+        "🔍 *Memecoin Launcher Bot Help*\n\n"
+        "*Commands:*\n"
+        "• /start - Start the bot\n"
+        "• /settings - View and update your settings\n"
+        "• /help - Show this help message\n"
+        "• /wallet - Check your wallet balance\n\n"
+
+        "*Creating Tokens:*\n"
+        "1. Click 'Create Token' on a tweet forwarded to the group\n"
+        "2. Review the generated token details in private chat\n"
+        "3. Adjust settings if needed\n"
+        "4. Click 'Launch Token on Solana'\n\n"
+
+        "*Settings:*\n"
+        "• Slippage - Maximum price movement allowed (default 5%)\n"
+        "• Priority Fee - Fee to prioritize transaction (default 0.1 SOL)\n"
+        "• Pool - Trading pool to use (pump, raydium, auto)\n"
+        "• Skip Preflight - Skip transaction simulation checks\n"
+        "• Jito Only - Only use Jito bundles for transactions\n"
+        "• Denominated in SOL - Trade amounts in SOL (vs. token)\n\n"
+
+        "If you have any issues, contact the administrator."
+    )
+
+    update.message.reply_text(
+        help_message,
+        parse_mode="Markdown"
+    )
+
+def wallet(update, context):
+    """Handle /wallet command"""
+    user_id = update.effective_user.id
+    user_settings = get_user_settings(user_id)
+
+    if not user_settings['wallet_address']:
+        update.message.reply_text(
+            "❌ You don't have a wallet set up yet. Would you like to create one?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Create wallet", callback_data="settings_wallet")],
+                [InlineKeyboardButton("↩️ Back to settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    # Show loading message
+    message = update.message.reply_text("⏳ Checking wallet balance...")
+
+    # Check SOL balance
+    success, balance_data, _ = check_wallet_balance(user_settings['wallet_address'])
+
+    if not success:
+        message.edit_text(
+            f"❌ Failed to check wallet balance: {balance_data.get('error', 'Unknown error')}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", callback_data="check_balance")]
+            ])
+        )
+        return
+
+    # Format SOL balance
+    sol_balance = balance_data.get('sol_balance', 0)
+
+    # Check token balances
+    success, tokens_data, _ = check_wallet_tokens(user_settings['wallet_address'])
+
+    if not success:
+        tokens_text = "❌ Failed to load token balances"
+    else:
+        tokens = tokens_data.get('tokens', [])
+        if tokens:
+            # Sort tokens by amount (descending)
+            tokens.sort(key=lambda x: x.get('amount', 0), reverse=True)
+            tokens_list = []
+
+            for token in tokens[:10]:  # Show top 10 tokens
+                token_amount = token.get('amount', 0)
+                token_mint = token.get('mint', 'Unknown')
+                token_short = f"{token_mint[:4]}...{token_mint[-4:]}"
+                tokens_list.append(f"• {token_amount} {token_short}")
+
+            tokens_text = "*Top Tokens:*\n" + "\n".join(tokens_list)
+
+            if len(tokens) > 10:
+                tokens_text += f"\n\n*+ {len(tokens) - 10} more tokens*"
+        else:
+            tokens_text = "*No tokens found in wallet*"
+
+    # Update message with wallet info
+    wallet_message = (
+        f"👛 *Wallet Balance*\n\n"
+        f"*Address:* `{user_settings['wallet_address']}`\n"
+        f"*SOL Balance:* {sol_balance:.4f} SOL\n\n"
+        f"{tokens_text}"
+    )
+
+    message.edit_text(
+        wallet_message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="check_balance")],
+            [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+        ])
+    )
+
+# Callback query handlers
+def button_click(update, context):
+    """Handle button clicks"""
+    query = update.callback_query
+    query.answer()
+
+    # Extract callback data
+    data = query.data
+
+    # Group actions
+    if data.startswith("create_token:"):
+        # Extract notification ID
+        notification_id = data.split(":", 1)[1]
+        send_token_generation_to_bot_chat(query, notification_id)
+        return
+
+    # Token actions
+    elif data.startswith("launch_token:"):
+        token_log_id = data.split(":", 1)[1]
+        launch_token_flow(query, token_log_id)
+        return
+
+    elif data.startswith("regenerate:"):
+        notification_id = data.split(":", 1)[1]
+        send_token_generation_to_bot_chat(query, notification_id)
+        return
+
+    elif data.startswith("create_wallet:"):
+        token_log_id = data.split(":", 1)[1] if ":" in data else None
+        create_new_wallet(update, context, token_log_id)
+        return
+
+    elif data == "cancel_launch":
+        query.message.edit_text(
+            "❌ Token launch cancelled.\n\nUse /settings to configure your wallet and try again.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Buy/Sell actions
+    elif data.startswith("buy_more:"):
+        token_address = data.split(":", 1)[1]
+        start_buy_flow(update, context, token_address)
+        return
+
+    elif data.startswith("sell_token:"):
+        token_address = data.split(":", 1)[1]
+        start_sell_flow(update, context, token_address)
+        return
+
+    # Settings actions
+    elif data == "show_settings":
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+
+        settings_message = (
+            "⚙️ *Your Settings*\n\n"
+            f"• *Slippage:* {user_settings['slippage']}%\n"
+            f"• *Priority Fee:* {user_settings['priority_fee']} SOL\n"
+            f"• *Pool:* {user_settings['pool']}\n"
+            f"• *Skip Preflight:* {'✅' if user_settings['skip_preflight'] else '❌'}\n"
+            f"• *Jito Only:* {'✅' if user_settings['jito_only'] else '❌'}\n"
+            f"• *Denominated in SOL:* {'✅' if user_settings['denominated_in_sol'] else '❌'}\n"
+            f"• *Wallet:* {user_settings['wallet_address'] or 'Not set'}\n\n"
+            "Use the buttons below to update your settings."
+        )
+
+        query.message.edit_text(
+            settings_message,
+            parse_mode="Markdown",
+            reply_markup=create_settings_keyboard()
+        )
+        return
+
+    elif data == "settings_slippage":
+        query.message.edit_text(
+            "🔢 Enter slippage percentage (1-50):\n\n"
+            "Slippage is the maximum price movement you're willing to accept.\n"
+            "Recommended: 5-10% for new tokens, 2-5% for established tokens.",
+            parse_mode="Markdown"
+        )
+        return SLIPPAGE
+
+    elif data == "settings_fee":
+        query.message.edit_text(
+            "💸 Enter priority fee in SOL (0.01-1):\n\n"
+            "Higher priority fees help transactions get processed faster.\n"
+            "Recommended: 0.05-0.2 SOL depending on network congestion.",
+            parse_mode="Markdown"
+        )
+        return PRIORITY_FEE
+
+    elif data == "settings_wallet":
+        query.message.edit_text(
+            "👛 *Wallet Management*\n\n"
+            "Choose an option:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🆕 Create New Wallet", callback_data="create_new_wallet")],
+                [InlineKeyboardButton("✏️ Enter Existing Address", callback_data="enter_wallet_address")],
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "create_new_wallet":
+        create_new_wallet(update, context)
+        return
+
+    elif data == "enter_wallet_address":
+        query.message.edit_text(
+            "✏️ Please enter your Solana wallet address:",
+            parse_mode="Markdown"
+        )
+        return WALLET_ADDRESS
+
+    elif data == "check_balance":
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+
+        if not user_settings['wallet_address']:
+            query.message.edit_text(
+                "❌ You don't have a wallet set up yet. Would you like to create one?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Create wallet", callback_data="settings_wallet")],
+                    [InlineKeyboardButton("↩️ Back to settings", callback_data="back_to_settings")]
+                ])
+            )
+            return
+
+        # Show loading message
+        query.message.edit_text("⏳ Checking wallet balance...")
+
+        # Check SOL balance
+        success, balance_data, _ = check_wallet_balance(user_settings['wallet_address'])
+
+        if not success:
+            query.message.edit_text(
+                f"❌ Failed to check wallet balance: {balance_data.get('error', 'Unknown error')}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="check_balance")]
+                ])
+            )
+            return
+
+        # Format SOL balance
+        sol_balance = balance_data.get('sol_balance', 0)
+
+        # Check token balances
+        success, tokens_data, _ = check_wallet_tokens(user_settings['wallet_address'])
+
+        if not success:
+            tokens_text = "❌ Failed to load token balances"
+        else:
+            tokens = tokens_data.get('tokens', [])
+            if tokens:
+                # Sort tokens by amount (descending)
+                tokens.sort(key=lambda x: x.get('amount', 0), reverse=True)
+                tokens_list = []
+
+                for token in tokens[:10]:  # Show top 10 tokens
+                    token_amount = token.get('amount', 0)
+                    token_mint = token.get('mint', 'Unknown')
+                    token_short = f"{token_mint[:4]}...{token_mint[-4:]}"
+                    tokens_list.append(f"• {token_amount} {token_short}")
+
+                tokens_text = "*Top Tokens:*\n" + "\n".join(tokens_list)
+
+                if len(tokens) > 10:
+                    tokens_text += f"\n\n*+ {len(tokens) - 10} more tokens*"
+            else:
+                tokens_text = "*No tokens found in wallet*"
+
+        # Update message with wallet info
+        wallet_message = (
+            f"👛 *Wallet Balance*\n\n"
+            f"*Address:* `{user_settings['wallet_address']}`\n"
+            f"*SOL Balance:* {sol_balance:.4f} SOL\n\n"
+            f"{tokens_text}"
+        )
+
+        query.message.edit_text(
+            wallet_message,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="check_balance")],
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "settings_pool":
+        query.message.edit_text(
+            "🔄 *Select Trading Pool*\n\n"
+            "Choose the pool to use for token trading:",
+            parse_mode="Markdown",
+            reply_markup=create_pool_selection_keyboard()
+        )
+        return
+
+    elif data.startswith("pool_"):
+        pool = data.split("_")[1]
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['pool'] = pool
+
+        query.message.edit_text(
+            f"✅ Pool updated to: *{pool}*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "toggle_preflight":
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['skip_preflight'] = not user_settings['skip_preflight']
+
+        status = "enabled" if user_settings['skip_preflight'] else "disabled"
+        query.message.edit_text(
+            f"✅ Skip Preflight {status}.\n\n"
+            f"When {'enabled' if user_settings['skip_preflight'] else 'disabled'}, transaction simulation "
+            f"checks will be {'skipped' if user_settings['skip_preflight'] else 'performed'} before sending.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "toggle_jito":
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['jito_only'] = not user_settings['jito_only']
+
+        status = "enabled" if user_settings['jito_only'] else "disabled"
+        query.message.edit_text(
+            f"✅ Jito Only {status}.\n\n"
+            f"When enabled, transactions will only be sent through Jito bundles.\n"
+            f"This may improve transaction success but could increase latency.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "toggle_denomination":
+        user_id = query.from_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['denominated_in_sol'] = not user_settings['denominated_in_sol']
+
+        denomination = "SOL" if user_settings['denominated_in_sol'] else "tokens"
+        query.message.edit_text(
+            f"✅ Denomination set to *{denomination}*.\n\n"
+            f"When buying, amounts will be interpreted as {denomination}.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return
+
+    elif data == "back_to_settings":
+        settings(update, context)
+        return
+
+    # If no pattern matched, show error message
+    query.message.reply_text(
+        "❗ Unknown button action. Please try again or use /help for assistance.",
+        parse_mode="Markdown"
+    )
+
+def create_new_wallet(update, context, token_log_id=None):
+    """Create new wallet via PumpPortal API"""
+    query = update.callback_query
+    if query:
+        query.message.edit_text("⏳ Creating new wallet...")
+    else:
+        context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="⏳ Creating new wallet..."
+        )
+
+    # Call API to create wallet
+    success, wallet_data, log_id = create_wallet_via_pump_portal()
+
+    if success and wallet_data.get('public_key'):
+        # Extract wallet info
+        public_key = wallet_data.get('public_key')
+        private_key = wallet_data.get('private_key', 'Not provided')
+        api_key = wallet_data.get('api_key', 'Not provided')
+
+        # Update user settings
+        user_id = update.effective_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['wallet_address'] = public_key
+
+        # Success message
+        wallet_message = (
+            f"✅ *New Wallet Created!*\n\n"
+            f"*Public Key:* `{public_key}`\n\n"
+            f"*Warning:* Keep your private key and API key secure!\n"
+            f"They have been sent to you as a separate message."
+        )
+
+        # Send keys in separate message for security
+        security_message = (
+            f"🔐 *Your Wallet Keys*\n\n"
+            f"*Private Key:* `{private_key}`\n\n"
+            f"*API Key:* `{api_key}`\n\n"
+            f"⚠️ *IMPORTANT:* Save these keys securely. Never share them with anyone.\n"
+            f"This message will be deleted in 60 seconds for security."
+        )
+
+        if query:
+            query.message.edit_text(
+                wallet_message,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")],
+                    [InlineKeyboardButton("🔄 Check Balance", callback_data="check_balance")]
+                ])
+            )
+        else:
+            context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=wallet_message,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")],
+                    [InlineKeyboardButton("🔄 Check Balance", callback_data="check_balance")]
+                ])
+            )
+
+        # Send security info as separate message that will delete after 60 seconds
+        security_msg = context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text=security_message,
+            parse_mode="Markdown"
+        )
+
+        # Schedule message deletion for security (60 seconds)
+        def delete_security_message(message_id, chat_id):
+            try:
+                context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception as e:
+                logger.error(f"Failed to delete security message: {e}")
+
+        threading.Timer(
+            60,
+            delete_security_message,
+            args=[security_msg.message_id, update.effective_user.id]
+        ).start()
+
+        # If we have a token_log_id, resume the launch flow
+        if token_log_id:
+            resume_launch_message = (
+                "✅ Wallet created successfully!\n\n"
+                "Would you like to continue launching your token?"
+            )
+
+            context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=resume_launch_message,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 Continue Launch", callback_data=f"launch_token:{token_log_id}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel_launch")]
+                ])
+            )
+    else:
+        # Error message
+        error_msg = wallet_data.get('error', 'Unknown error')
+        error_message = f"❌ Failed to create wallet: {error_msg}"
+
+        if query:
+            query.message.edit_text(
+                error_message,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="create_new_wallet")],
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+                ])
+            )
+        else:
+            context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=error_message,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="create_new_wallet")],
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+                ])
+            )
+
+def start_buy_flow(update, context, token_address):
+    """Start the flow to buy more of a token"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_settings = get_user_settings(user_id)
+
+    if not user_settings['wallet_address']:
+        query.message.reply_text(
+            "❌ You need to set up a wallet first before buying tokens.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👛 Set Up Wallet", callback_data="settings_wallet")]
+            ])
+        )
+        return
+
+    # Ask for amount
+    query.message.reply_text(
+        f"💰 *Buy Token*\n\n"
+        f"Token: `{token_address}`\n\n"
+        f"Enter amount to buy "
+        f"(in {'SOL' if user_settings['denominated_in_sol'] else 'tokens'}):",
+        parse_mode="Markdown"
+    )
+
+    # Store token address in user data
+    context.user_data['buy_token_address'] = token_address
+
+    return TOKEN_SUPPLY  # Reusing TOKEN_SUPPLY state for amount input
+
+def start_sell_flow(update, context, token_address):
+    """Start the flow to sell a token"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_settings = get_user_settings(user_id)
+
+    if not user_settings['wallet_address']:
+        query.message.reply_text(
+            "❌ You need to set up a wallet first before selling tokens.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👛 Set Up Wallet", callback_data="settings_wallet")]
+            ])
+        )
+        return
+
+    # Create sell percentage keyboard
+    sell_keyboard = [
+        [
+            InlineKeyboardButton("25%", callback_data=f"sell_percent:{token_address}:25"),
+            InlineKeyboardButton("50%", callback_data=f"sell_percent:{token_address}:50"),
+            InlineKeyboardButton("75%", callback_data=f"sell_percent:{token_address}:75")
+        ],
+        [
+            InlineKeyboardButton("100% (Sell All)", callback_data=f"sell_percent:{token_address}:100")
+        ],
+        [
+            InlineKeyboardButton("↩️ Cancel", callback_data="cancel_sell")
+        ]
+    ]
+
+    query.message.reply_text(
+        f"💸 *Sell Token*\n\n"
+        f"Token: `{token_address}`\n\n"
+        f"Select percentage to sell:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(sell_keyboard)
+    )
+
+# Message handlers for conversation states
+def handle_slippage_input(update, context):
+    """Handle slippage input"""
+    try:
+        slippage = float(update.message.text.strip())
+        if 1 <= slippage <= 50:
+            user_id = update.effective_user.id
+            user_settings = get_user_settings(user_id)
+            user_settings['slippage'] = slippage
+
+            update.message.reply_text(
+                f"✅ Slippage updated to {slippage}%",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+                ])
+            )
+            return ConversationHandler.END
+        else:
+            update.message.reply_text(
+                "❌ Invalid input. Slippage must be between 1% and 50%.\n"
+                "Please try again:"
+            )
+            return SLIPPAGE
+    except ValueError:
+        update.message.reply_text(
+            "❌ Invalid input. Please enter a number between 1 and 50:"
+        )
+        return SLIPPAGE
+
+def handle_priority_fee_input(update, context):
+    """Handle priority fee input"""
+    try:
+        fee = float(update.message.text.strip())
+        if 0.01 <= fee <= 1:
+            user_id = update.effective_user.id
+            user_settings = get_user_settings(user_id)
+            user_settings['priority_fee'] = fee
+
+            update.message.reply_text(
+                f"✅ Priority fee updated to {fee} SOL",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+                ])
+            )
+            return ConversationHandler.END
+        else:
+            update.message.reply_text(
+                "❌ Invalid input. Fee must be between 0.01 and 1 SOL.\n"
+                "Please try again:"
+            )
+            return PRIORITY_FEE
+    except ValueError:
+        update.message.reply_text(
+            "❌ Invalid input. Please enter a number between 0.01 and 1:"
+        )
+        return PRIORITY_FEE
+
+def handle_wallet_address_input(update, context):
+    """Handle wallet address input"""
+    address = update.message.text.strip()
+
+    # Basic validation - Solana addresses are 32-44 characters
+    if len(address) >= 32 and len(address) <= 44:
+        user_id = update.effective_user.id
+        user_settings = get_user_settings(user_id)
+        user_settings['wallet_address'] = address
+
+        update.message.reply_text(
+            f"✅ Wallet address updated to:\n`{address}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Check Balance", callback_data="check_balance")],
+                [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+            ])
+        )
+        return ConversationHandler.END
+    else:
+        update.message.reply_text(
+            "❌ Invalid Solana address. Please ensure you've entered a valid address:"
+        )
+        return WALLET_ADDRESS
+
+def handle_token_amount_input(update, context):
+    """Handle token amount input for buying"""
+    try:
+        amount = float(update.message.text.strip())
+        if amount <= 0:
+            update.message.reply_text(
+                "❌ Amount must be greater than 0. Please try again:"
+            )
+            return TOKEN_SUPPLY
+
+        user_id = update.effective_user.id
+        token_address = context.user_data.get('buy_token_address')
+
+        if not token_address:
+            update.message.reply_text(
+                "❌ Token information not found. Please try again from the beginning.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+                ])
+            )
+            return ConversationHandler.END
+
+        # Show confirmation
+        user_settings = get_user_settings(user_id)
+        denomination = "SOL" if user_settings['denominated_in_sol'] else "tokens"
+
+        update.message.reply_text(
+            f"🔍 *Confirm Purchase*\n\n"
+            f"Token: `{token_address}`\n"
+            f"Amount: {amount} {denomination}\n"
+            f"Slippage: {user_settings['slippage']}%\n"
+            f"Priority Fee: {user_settings['priority_fee']} SOL\n"
+            f"Pool: {user_settings['pool']}\n\n"
+            f"Do you want to proceed?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm Buy", callback_data=f"confirm_buy:{token_address}:{amount}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_buy")]
+            ])
+        )
+
+        return ConversationHandler.END
+
+    except ValueError:
+        update.message.reply_text(
+            "❌ Invalid input. Please enter a valid number:"
+        )
+        return TOKEN_SUPPLY
+
+def handle_cancel(update, context):
+    """Cancel the conversation"""
+    update.message.reply_text(
+        "❌ Operation cancelled.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ Back to Settings", callback_data="back_to_settings")]
+        ])
+    )
+    return ConversationHandler.END
+
+def execute_buy(update, context):
+    """Execute buy operation after confirmation"""
+    query = update.callback_query
+    query.answer()
+
+    # Parse callback data
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        query.message.edit_text("❌ Invalid operation. Please try again.")
+        return
+
+    token_address = parts[1]
+    try:
+        amount = float(parts[2])
+    except ValueError:
+        query.message.edit_text("❌ Invalid amount. Please try again.")
+        return
+
+    user_id = query.from_user.id
+    user_settings = get_user_settings(user_id)
+
+    # Execute buy
+    query.message.edit_text("⏳ Processing buy transaction...")
+
+    success, response_data, log_id = buy_token(user_id, token_address, amount, user_settings)
+
+    if success and response_data.get('signature'):
+        tx_signature = response_data.get('signature')
+
+        success_message = (
+            f"✅ *Purchase Successful!*\n\n"
+            f"Token: `{token_address}`\n"
+            f"Amount: {amount} {'SOL' if user_settings['denominated_in_sol'] else 'tokens'}\n\n"
+            f"Transaction: [View on Solscan](https://solscan.io/tx/{tx_signature})\n\n"
+            f"Log ID: `{log_id}`"
+        )
+
+        query.message.edit_text(
+            success_message,
+            parse_mode="Markdown",
+            disable_web_page_preview=False,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 View Token", url=f"https://pump.fun/token/{token_address}")],
+                [InlineKeyboardButton("🔄 Buy More", callback_data=f"buy_more:{token_address}")]
+            ])
+        )
+    else:
+        error_msg = response_data.get('error', 'Unknown error')
+
+        error_message = (
+            f"❌ *Purchase Failed*\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Please check your settings and try again."
+        )
+
+        query.message.edit_text(
+            error_message,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Adjust Settings", callback_data="show_settings")],
+                [InlineKeyboardButton("🔄 Try Again", callback_data=f"buy_more:{token_address}")]
+            ])
+        )
+
+def execute_sell(update, context):
+    """Execute sell operation"""
+    query = update.callback_query
+    query.answer()
+
+    # Parse callback data
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        query.message.edit_text("❌ Invalid operation. Please try again.")
+        return
+
+    token_address = parts[1]
+    try:
+        percentage = int(parts[2])
+        if percentage <= 0 or percentage > 100:
+            raise ValueError("Percentage out of range")
+    except ValueError:
+        query.message.edit_text("❌ Invalid percentage. Please try again.")
+        return
+
+    user_id = query.from_user.id
+    user_settings = get_user_settings(user_id)
+
+    # Execute sell
+    query.message.edit_text(f"⏳ Processing sell transaction ({percentage}%)...")
+
+    success, response_data, log_id = sell_token(user_id, token_address, percentage, user_settings)
+
+    if success and response_data.get('signature'):
+        tx_signature = response_data.get('signature')
+
+        success_message = (
+            f"✅ *Sell Successful!*\n\n"
+            f"Token: `{token_address}`\n"
+            f"Amount: {percentage}% of holdings\n\n"
+            f"Transaction: [View on Solscan](https://solscan.io/tx/{tx_signature})\n\n"
+            f"Log ID: `{log_id}`"
+        )
+
+        query.message.edit_text(
+            success_message,
+            parse_mode="Markdown",
+            disable_web_page_preview=False,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 View Token", url=f"https://pump.fun/token/{token_address}")],
+                [InlineKeyboardButton("💼 Check Wallet", callback_data="check_balance")]
+            ])
+        )
+    else:
+        error_msg = response_data.get('error', 'Unknown error')
+
+        error_message = (
+            f"❌ *Sell Failed*\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Please check your settings and try again."
+        )
+
+        query.message.edit_text(
+            error_message,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Adjust Settings", callback_data="show_settings")],
+                [InlineKeyboardButton("🔄 Try Again", callback_data=f"sell_token:{token_address}")]
+            ])
+        )
+
+def main():
+    """Main function to run the bot"""
+    # Set up command handlers
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("settings", settings))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("wallet", wallet))
+
+    # Set up conversation handlers
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                button_click,
+                pattern="^settings_slippage$|^settings_fee$|^enter_wallet_address$"
+            )
+        ],
+        states={
+            SLIPPAGE: [MessageHandler(Filters.text & ~Filters.command, handle_slippage_input)],
+            PRIORITY_FEE: [MessageHandler(Filters.text & ~Filters.command, handle_priority_fee_input)],
+            WALLET_ADDRESS: [MessageHandler(Filters.text & ~Filters.command, handle_wallet_address_input)],
+            TOKEN_SUPPLY: [MessageHandler(Filters.text & ~Filters.command, handle_token_amount_input)],
+        },
+        fallbacks=[CommandHandler("cancel", handle_cancel)]
+    )
+    dispatcher.add_handler(conv_handler)
+
+    # Add callback query handlers
+    dispatcher.add_handler(CallbackQueryHandler(execute_buy, pattern='^confirm_buy:'))
+    dispatcher.add_handler(CallbackQueryHandler(execute_sell, pattern='^sell_percent:'))
+    dispatcher.add_handler(CallbackQueryHandler(button_click))
+
+    # Start Telegram bot
+    updater.start_polling()
+    logger.info("Telegram bot started")
+
+    # Connect to Discord Gateway
+    connect()
+    logger.info("Discord connection initialized")
+
+    # Run the bot until you press Ctrl-C
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
